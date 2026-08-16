@@ -28,7 +28,7 @@ mitgelieferten Binaries (Electron-Runtime, `ffmpeg`/`ffprobe` aus `ffmpeg-static
 ## Stack
 
 - Electron (Main / Preload / Renderer)
-- `@anthropic-ai/sdk` — Skriptgenerierung, Default-Modell `claude-opus-5`
+- Claude Code CLI (Abo) **oder** `@anthropic-ai/sdk` (API-Key) — Skriptgenerierung, Default-Modell `claude-opus-5`
 - `openai` — zusätzlicher Provider
 - `zod` — Schema-Validierung
 - `ffmpeg-static` / `ffprobe-static` — Rendering & Medienanalyse
@@ -44,6 +44,30 @@ mitgelieferten Binaries (Electron-Runtime, `ffmpeg`/`ffprobe` aus `ffmpeg-static
 - **Accounts, Snapshots, Tracking, Optimierungen, Knowledge Base** — jeweils list/save/delete
 
 API-Keys werden zur Laufzeit in den Settings gehalten; im Build sind keine Keys hinterlegt (geprüft).
+
+## Skriptgenerierung über das Claude-Abo statt über API-Credits
+
+`generateScript` wählt den Weg automatisch anhand des Anthropic-API-Keys in den Einstellungen:
+
+| Key-Feld in den Settings | Weg | Abrechnung |
+|---|---|---|
+| **leer** (Default) | ruft die lokal installierte **Claude Code CLI** auf | läuft über dein Claude-Abo |
+| gefüllt | `@anthropic-ai/sdk` → Anthropic-API | API-Credits |
+
+Der Abo-Weg spawnt `claude -p --output-format json --model <modell> --system-prompt <…> --strict-mcp-config --disallowed-tools <…>`,
+schickt den Prompt über **stdin** (kein `shell: true`, keine Injection-Fläche) und liest das `result`-Feld aus der JSON-Antwort.
+Das Abschalten der Tools ist nicht kosmetisch: es senkt den Overhead pro Aufruf von ~30.500 auf ~3.900 Tokens,
+weil die kompletten Tool-Definitionen sonst in jedem Request mitgeschickt werden.
+
+Voraussetzung: Claude Code ist installiert und per `claude login` mit dem Abo angemeldet.
+Die Binary wird in dieser Reihenfolge gesucht: `CUTPILOT_CLAUDE_BIN` (Env-Override) →
+`%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` → `~/.local/bin/claude[.exe]` →
+`/opt/homebrew/bin/claude` → `/usr/local/bin/claude` → `claude` auf dem PATH.
+
+**Was das Abo nicht abdeckt:** die Voiceover-Transkription (`transcribeWithWhisper`) läuft über OpenAI Whisper
+und braucht weiterhin einen eigenen OpenAI-API-Key. Claude kann kein Audio transkribieren.
+
+Getestet gegen Claude Code 2.1.220: schema-valides Skript-JSON, ~19 s pro Generierung.
 
 ## Start
 

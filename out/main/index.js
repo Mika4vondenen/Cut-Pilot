@@ -537,44 +537,180 @@ function mapApiError(err, model) {
   }
   return err instanceof Error ? err : new Error(String(err));
 }
+const CLAUDE_CLI_DISALLOWED_TOOLS = "Bash Edit Write Read Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit BashOutput KillShell SlashCommand Skill";
+const CLAUDE_CLI_TIMEOUT_MS = 6e5;
+let claudeBinCache = null;
+function resolveClaudeBin() {
+  if (claudeBinCache) return claudeBinCache;
+  const override = process.env.CUTPILOT_CLAUDE_BIN?.trim();
+  if (override) {
+    claudeBinCache = override;
+    return claudeBinCache;
+  }
+  const home = electron.app.getPath("home");
+  const candidates = [];
+  if (process.platform === "win32") {
+    if (process.env.APPDATA) {
+      candidates.push(
+        path.join(
+          process.env.APPDATA,
+          "npm",
+          "node_modules",
+          "@anthropic-ai",
+          "claude-code",
+          "bin",
+          "claude.exe"
+        )
+      );
+    }
+    candidates.push(path.join(home, ".local", "bin", "claude.exe"));
+  } else {
+    candidates.push(path.join(home, ".local", "bin", "claude"));
+    candidates.push("/opt/homebrew/bin/claude");
+    candidates.push("/usr/local/bin/claude");
+  }
+  for (const candidate of candidates) {
+    try {
+      if (node_fs.existsSync(candidate)) {
+        claudeBinCache = candidate;
+        return claudeBinCache;
+      }
+    } catch {
+    }
+  }
+  claudeBinCache = "claude";
+  return claudeBinCache;
+}
+function runClaudeCli(model, system, prompt) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-p",
+      "--output-format",
+      "json",
+      "--model",
+      model,
+      "--system-prompt",
+      system,
+      "--strict-mcp-config",
+      "--disallowed-tools",
+      CLAUDE_CLI_DISALLOWED_TOOLS
+    ];
+    let proc;
+    try {
+      proc = node_child_process.spawn(resolveClaudeBin(), args, { windowsHide: true });
+    } catch (err) {
+      reject(new Error(`Claude Code konnte nicht gestartet werden: ${err.message}`));
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      finish(reject, new Error("Claude Code hat zu lange gebraucht und wurde abgebrochen."));
+    }, CLAUDE_CLI_TIMEOUT_MS);
+    function finish(fn, value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    }
+    proc.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    proc.stderr?.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString("utf8")).slice(-2e3);
+    });
+    proc.on("error", (err) => {
+      finish(
+        reject,
+        new Error(
+          `Claude Code wurde nicht gefunden (${err.message}). Bitte installiere die Claude-Code-CLI und melde dich mit "claude login" an — oder trage einen Anthropic-API-Key in den Einstellungen ein.`
+        )
+      );
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        const detail = lastStderrLines(stderr);
+        finish(
+          reject,
+          new Error(`Claude Code ist fehlgeschlagen (Code ${code ?? "?"})${detail ? `: ${detail}` : "."}`)
+        );
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        finish(reject, new Error("Die Antwort von Claude Code war kein gültiges JSON."));
+        return;
+      }
+      if (parsed.is_error === true || parsed.subtype !== "success") {
+        const detail = typeof parsed.result === "string" && parsed.result.trim() ? parsed.result.trim() : parsed.subtype || "unbekannt";
+        finish(reject, new Error(`Claude Code meldet einen Fehler: ${detail}`));
+        return;
+      }
+      finish(resolve, {
+        text: typeof parsed.result === "string" ? parsed.result : "",
+        stopReason: typeof parsed.stop_reason === "string" ? parsed.stop_reason : null
+      });
+    });
+    proc.stdin?.on("error", () => {
+    });
+    proc.stdin?.end(prompt, "utf8");
+  });
+}
+function flattenForCli(messages) {
+  return messages.map(
+    (m) => m.role === "assistant" ? `--- Deine vorherige Antwort ---
+${m.content}` : m.content
+  ).join("\n\n");
+}
 async function generateScript(request) {
   const settings = await getSettings();
-  if (!settings.anthropicApiKey) {
-    throw new Error("Kein Anthropic-API-Key hinterlegt. Bitte trage ihn in den Einstellungen ein.");
-  }
+  const useCli = !settings.anthropicApiKey;
   const niches = await listNiches();
   const niche = niches.find((n) => n.id === request.nicheId);
   if (!niche) {
     throw new Error("Die gewählte Nische wurde nicht gefunden. Bitte lege sie erneut an.");
   }
-  const client = new Anthropic({ apiKey: settings.anthropicApiKey });
+  const client = useCli ? null : new Anthropic({ apiKey: settings.anthropicApiKey });
   const model = settings.scriptModel || DEFAULT_SCRIPT_MODEL;
   const system = buildSystemPrompt(niche, request);
   const messages = [{ role: "user", content: buildUserPrompt(request) }];
   const maxAttempts = 2;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let response;
-    try {
-      response = await client.messages.create({
-        model,
-        max_tokens: MAX_TOKENS,
-        system,
-        messages
-      });
-    } catch (err) {
-      throw mapApiError(err, model);
+    let text;
+    let stopReason;
+    if (useCli) {
+      const result = await runClaudeCli(model, system, flattenForCli(messages));
+      text = result.text;
+      stopReason = result.stopReason;
+    } else {
+      let response;
+      try {
+        response = await client.messages.create({
+          model,
+          max_tokens: MAX_TOKENS,
+          system,
+          messages
+        });
+      } catch (err) {
+        throw mapApiError(err, model);
+      }
+      text = extractText(response);
+      stopReason = response.stop_reason;
     }
-    if (response.stop_reason === "refusal") {
+    if (stopReason === "refusal") {
       throw new Error(
         "Die Skript-Erstellung wurde vom Modell abgelehnt. Bitte formuliere das Thema um."
       );
     }
-    if (response.stop_reason === "max_tokens") {
+    if (stopReason === "max_tokens") {
       throw new Error(
         "Das Skript ist zu lang für eine einzelne Antwort. Bitte reduziere die Ziel-Länge oder teile das Thema in mehrere Videos auf."
       );
     }
-    const text = extractText(response);
     try {
       return finalizeScript(parseVideoScript(text));
     } catch (parseErr) {
